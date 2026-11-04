@@ -13,6 +13,21 @@
 //      avec le systeme de musique streamee du jeu (bgmStreamPrepare / Play) ;
 //   3. quand le jeu arrete la musique (Z2SeqMgr::bgmStop), on arrete le stream.
 
+// Le jeu redefinit "nullptr" (via global.h, inclus automatiquement), ce qui casse les
+// en-tetes standard de MSVC comme <filesystem>/<chrono>. On les inclut donc en premier,
+// avec cette redefinition mise de cote temporairement.
+#pragma push_macro("nullptr")
+#undef nullptr
+#include <algorithm>
+#include <cctype>
+#include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <string>
+#include <unordered_map>
+#include <vector>
+#pragma pop_macro("nullptr")
+
 #include "mods/service.hpp"
 #include "mods/svc/hook.hpp"
 #include "mods/svc/log.hpp"
@@ -23,15 +38,6 @@
 
 // Game includes
 #include "Z2AudioLib/Z2SeqMgr.h"
-
-#include <algorithm>
-#include <cctype>
-#include <cstdint>
-#include <filesystem>
-#include <fstream>
-#include <string>
-#include <unordered_map>
-#include <vector>
 
 // Mettre 0 si la compilation echoue a cause du panneau d'interface.
 #define ENABLE_UI_PANEL 1
