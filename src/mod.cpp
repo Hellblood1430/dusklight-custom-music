@@ -1,16 +1,23 @@
-// Dusklight Custom Music - version 0.3 (experimentale, avec journal de diagnostic)
+// Dusklight Custom Music - version 0.5 (experimentale, melange aleatoire par sauvegarde)
 //
 // Remplace des musiques de fond du jeu (sequences) par tes propres fichiers .ast.
-// Depose tes fichiers dans le dossier "music" du mod (son chemin s'affiche dans
-// le panneau des mods, et dans le journal au demarrage). Le nom du fichier doit
-// etre le nom du morceau du jeu, par exemple FIELD_LINK_DAY.ast
 //
-// Principe :
-//   1. au demarrage, on cherche les .ast du dossier "music" et on les declare
-//      au jeu comme de nouveaux streams (AudioResService) ;
-//   2. quand le jeu demande une musique remplacee (Z2SeqMgr::bgmStart), on
-//      annule la sequence d'origine et on lance a la place la musique en stream
-//      avec le systeme de musique streamee du jeu (bgmStreamPrepare / Play) ;
+// Deux facons de l'utiliser, dans le dossier "music" du mod :
+//   - un fichier dont le nom est celui d'un morceau du jeu (ex: RANCH.ast) remplace
+//     exactement ce morceau ;
+//   - tous les autres fichiers .ast (n'importe quel nom) forment une "reserve" qui
+//     est repartie au hasard sur les musiques de zone du jeu (champs, villages,
+//     donjons...). Chaque SAUVEGARDE a sa propre graine, enregistree avec elle
+//     (SaveService) : une nouvelle partie = un nouveau melange, et charger une
+//     partie existante redonne le meme melange. Pour imposer la meme graine a
+//     toutes les sauvegardes, cree un fichier seed_force.txt (un nombre ou un mot).
+//
+// Principe technique :
+//   1. au demarrage, on declare les .ast au jeu comme de nouveaux streams
+//      (AudioResService) ;
+//   2. quand le jeu demande une musique remplacee (Z2SeqMgr::bgmStart), on annule la
+//      sequence d'origine et on lance a la place le stream avec le systeme de musique
+//      streamee du jeu (bgmStreamPrepare / Play) ;
 //   3. quand le jeu arrete la musique (Z2SeqMgr::bgmStop), on arrete le stream.
 
 // Le jeu redefinit "nullptr" (via global.h, inclus automatiquement), ce qui casse les
@@ -21,10 +28,13 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
+#include <deque>
 #include <filesystem>
 #include <fstream>
+#include <random>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #pragma pop_macro("nullptr")
 
@@ -33,6 +43,7 @@
 #include "mods/svc/log.hpp"
 #include "mods/svc/host.h"
 #include "mods/svc/overlay.h"
+#include "mods/svc/save.h"
 #include "mods/svc/audio_res.h"
 #include "mods/svc/ui.h"
 
@@ -50,6 +61,7 @@ IMPORT_SERVICE(LogService, svc_log);
 IMPORT_SERVICE(HookService, svc_hook);
 IMPORT_SERVICE(HostService, svc_host);
 IMPORT_SERVICE(OverlayService, svc_overlay);
+IMPORT_SERVICE(SaveService, svc_save);
 IMPORT_SERVICE(AudioResService, svc_audio_res);
 #if ENABLE_UI_PANEL
 IMPORT_SERVICE(UiService, svc_ui);
@@ -106,6 +118,23 @@ static const BgmName kBgmNames[] = {
 #undef X
 };
 
+// Musiques de "zone" qui peuvent recevoir un morceau tire au hasard.
+// (Les jingles, fanfares, menus, hurlements, combats et boss ne sont pas touches.)
+#define ZONE_LIST(X) \
+    X(FIELD_LINK_DAY) X(FIELD_LINK_NIGHT) X(FIELD) X(DUNGEON) X(TOAL_VILLEGE) X(TOAL_NIGHT) \
+    X(DUNGEON_FOREST) X(RANCH) X(TWILIGHT) X(DUNGEON_LV2) X(DUNGEON_LV3) X(DUNGEON_LV4) \
+    X(DUNGEON_LV5) X(DUNGEON_LV6) X(DUNGEON_LV7) X(DUNGEON_LV8) X(DUNGEON_LV9_02) \
+    X(DEATH_MOUNTAIN01) X(DEATH_MOUNTAIN02) X(KAKARIKO) X(DESERT) X(ZORA_VILLAGE) \
+    X(CASTLE_TOWN) X(HOLY_FOREST) X(SNOW_MOUNTAIN) X(LAKE) X(HIDDEN_VILLAGE) X(FILONE_FOREST) \
+    X(INDOOR) X(INDOOR_03) X(INDOOR_04) X(SHOP01) X(SHOP02) X(CHURCH1) X(CHURCH2) X(ROOM_2) \
+    X(SUB_DUNGEON) X(TEMPLE_OF_TIME) X(MINIGAME_ROOM)
+
+static const uint32_t kZoneIds[] = {
+#define X(n) static_cast<uint32_t>(Z2BGM_##n),
+    ZONE_LIST(X)
+#undef X
+};
+
 static std::string to_lower(std::string s) {
     for (char& c : s) {
         c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
@@ -148,8 +177,7 @@ static std::string path_to_utf8(const std::filesystem::path& p) {
 // ---------------------------------------------------------------------------
 
 struct Track {
-    std::string name;       // ex: FIELD_LINK_DAY
-    uint32_t bgmId = 0;     // ex: Z2BGM_FIELD_LINK_DAY
+    std::string name;       // nom du fichier sans extension
     std::filesystem::path file;
     std::string discPath;   // chemin virtuel donne au jeu
     uint16_t streamId = 0;  // ID attribue par AudioResService
@@ -160,7 +188,18 @@ struct Track {
 
 enum class State { Idle, Loading, Preparing, Playing };
 
-static std::unordered_map<uint32_t, Track> g_tracks;  // cle = ID de la musique du jeu
+static std::deque<Track> g_files;                      // tous les fichiers .ast trouves
+static std::unordered_map<uint32_t, Track*> g_tracks;  // ID de musique du jeu -> fichier
+static uint32_t g_curBgm = 0;                          // musique du jeu actuellement remplacee
+
+// Melange par sauvegarde
+static std::vector<Track*> g_pool;                      // fichiers a repartir au hasard
+static std::unordered_map<uint32_t, Track*> g_shuffled; // zone -> fichier, pour la sauvegarde actuelle
+static std::unordered_set<uint32_t> g_zoneSet;          // zones eligibles au melange
+static bool g_shuffleValid = false;
+static uint64_t g_shuffleSeed = 0;
+static bool g_forcedSeed = false;
+static uint64_t g_forcedSeedValue = 0;
 static State g_state = State::Idle;
 static Track* g_cur = nullptr;
 static int g_wait = 0;
@@ -239,8 +278,10 @@ static bool ensure_loaded(Track& t) {
 // Le stream n'a pas demarre : on rend la main a la musique d'origine.
 static void fail_custom(Z2SeqMgr* seq, const char* why) {
     Track* t = g_cur;
+    uint32_t bgm = g_curBgm;
     g_state = State::Idle;
     g_cur = nullptr;
+    g_curBgm = 0;
     if (t == nullptr) {
         return;
     }
@@ -248,7 +289,7 @@ static void fail_custom(Z2SeqMgr* seq, const char* why) {
     seq->bgmStreamStop(0);
     t->failed = true;
     g_internal = true;
-    seq->bgmStart(t->bgmId, 0, 0);
+    seq->bgmStart(bgm, 0, 0);
     g_internal = false;
 }
 
@@ -264,6 +305,81 @@ static void stop_custom(uint32_t fadeTime) {
     cm_log("musique custom arretee ({})", g_cur ? g_cur->name : std::string("?"));
     g_state = State::Idle;
     g_cur = nullptr;
+    g_curBgm = 0;
+}
+
+// ---------------------------------------------------------------------------
+// Melange aleatoire (une graine par sauvegarde)
+// ---------------------------------------------------------------------------
+
+static void rebuild_shuffle(uint64_t seed) {
+    g_shuffled.clear();
+    std::mt19937_64 rng(seed);
+    auto shuffle_vec = [&](std::vector<Track*>& v) {
+        for (size_t i = v.size(); i > 1; --i) {
+            size_t k = static_cast<size_t>(rng() % i);
+            std::swap(v[i - 1], v[k]);
+        }
+    };
+    cm_log("melange pour cette sauvegarde (graine {})", seed);
+    std::vector<Track*> deck;  // tirage sans remise, remelange quand c'est vide
+    for (uint32_t id : kZoneIds) {
+        if (g_tracks.count(id)) {
+            continue;  // deja fixe par un nom de fichier
+        }
+        if (deck.empty()) {
+            deck = g_pool;
+            shuffle_vec(deck);
+        }
+        Track* t = deck.back();
+        deck.pop_back();
+        g_shuffled[id] = t;
+        cm_log("  {} -> {}", bgm_name(id), t->name);
+    }
+    g_shuffleSeed = seed;
+    g_shuffleValid = true;
+}
+
+// Retourne vrai si un melange est disponible pour la sauvegarde en cours.
+// La graine est lue dans les donnees de la sauvegarde ; si elle n'existe pas encore
+// (nouvelle partie), on en tire une au hasard et on l'y enregistre.
+static bool ensure_shuffle() {
+    if (g_pool.empty()) {
+        return false;
+    }
+    uint64_t seed = 0;
+    bool have = false;
+    if (g_forcedSeed) {
+        seed = g_forcedSeedValue;
+        have = true;
+    } else {
+        uint64_t stored = 0;
+        size_t size = sizeof(stored);
+        if (svc_save->get_blob(mod_ctx, "music_seed", &stored, &size) == MOD_OK &&
+            size == sizeof(stored) && stored != 0) {
+            seed = stored;
+            have = true;
+        } else {
+            std::random_device rd;
+            uint64_t fresh = (static_cast<uint64_t>(rd()) << 32) ^ static_cast<uint64_t>(rd());
+            if (fresh == 0) {
+                fresh = 1;
+            }
+            if (svc_save->set_blob(mod_ctx, "music_seed", &fresh, sizeof(fresh)) == MOD_OK) {
+                seed = fresh;
+                have = true;
+                cm_log("nouvelle sauvegarde : graine {} creee", seed);
+            }
+        }
+    }
+    if (!have) {
+        cm_log_warn("aucune sauvegarde active : pas de melange pour l'instant");
+        return false;
+    }
+    if (!g_shuffleValid || g_shuffleSeed != seed) {
+        rebuild_shuffle(seed);
+    }
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -280,19 +396,28 @@ static HookAction on_bgm_start_pre(ModContext*, void* args, void*, void*) {
     uint32_t fade = mods::arg<uint32_t>(args, 2);
     cm_log("bgmStart id=0x{:X} nom={} fondu={}", bgmId, bgm_name(bgmId), fade);
 
+    Track* track = nullptr;
     auto it = g_tracks.find(bgmId);
-    if (it == g_tracks.end()) {
+    if (it != g_tracks.end()) {
+        track = it->second;  // morceau fixe (nom de fichier = nom du morceau)
+    } else if (g_zoneSet.count(bgmId) && ensure_shuffle()) {
+        auto sit = g_shuffled.find(bgmId);
+        if (sit != g_shuffled.end()) {
+            track = sit->second;
+        }
+    }
+    if (track == nullptr) {
         // Musique non remplacee : on coupe la notre si elle joue, le jeu fait le reste.
         stop_custom(fade);
         return HOOK_CONTINUE;
     }
-    if (it->second.failed) {
+    if (track->failed) {
         return HOOK_CONTINUE;  // ce morceau n'a pas marche : musique d'origine
     }
-    if (g_cur == &it->second && g_state != State::Idle) {
+    if (g_curBgm == bgmId && g_state != State::Idle) {
         return HOOK_SKIP_ORIGINAL;  // deja en train de jouer
     }
-    if (!ensure_loaded(it->second)) {
+    if (!ensure_loaded(*track)) {
         return HOOK_CONTINUE;  // probleme de fichier : la musique d'origine joue
     }
 
@@ -301,9 +426,10 @@ static HookAction on_bgm_start_pre(ModContext*, void* args, void*, void*) {
     seq->bgmStop(fade, 0);  // coupe la sequence d'origine eventuellement en cours
     g_internal = false;
 
-    g_cur = &it->second;
+    g_cur = track;
+    g_curBgm = bgmId;
     g_state = State::Loading;
-    cm_log("musique custom demandee : {}", it->second.name);
+    cm_log("musique custom demandee : {} (pour {})", track->name, bgm_name(bgmId));
     return HOOK_SKIP_ORIGINAL;  // on n'ouvre pas la sequence d'origine
 }
 
@@ -326,7 +452,7 @@ static void on_check_bgm_playing_post(ModContext*, void* args, void* retval, voi
         return;
     }
     uint32_t bgmId = mods::arg<uint32_t>(args, 1);
-    if (bgmId == g_cur->bgmId) {
+    if (bgmId == g_curBgm) {
         *static_cast<bool*>(retval) = true;
     }
 }
@@ -357,62 +483,107 @@ MOD_EXPORT ModResult mod_initialize(ModError*) {
         cm_log_err("impossible d'obtenir le dossier de donnees du mod");
         return MOD_ERROR;
     }
+    std::filesystem::path dataPath = path_from_utf8(dataDir);
 
-    std::filesystem::path logPath = path_from_utf8(dataDir) / "custom_music_log.txt";
+    std::filesystem::path logPath = dataPath / "custom_music_log.txt";
     g_logPathText = path_to_utf8(logPath);
     g_logFile.open(logPath, std::ios::out | std::ios::trunc);
-    cm_log("Custom Music v0.3 : demarrage");
+    cm_log("Custom Music v0.5 : demarrage");
 
-    std::filesystem::path musicDir = path_from_utf8(dataDir) / "music";
+    std::filesystem::path musicDir = dataPath / "music";
     std::error_code ec;
     std::filesystem::create_directories(musicDir, ec);
     g_musicDirText = path_to_utf8(musicDir);
     cm_log("dossier des musiques : {}", g_musicDirText);
 
-    // Table nom (en minuscules) -> ID de musique.
+    // Table nom (en minuscules) -> ID de musique du jeu.
     std::unordered_map<std::string, uint32_t> byName;
     for (const BgmName& b : kBgmNames) {
         byName[to_lower(b.name)] = b.id;
     }
 
-    std::vector<std::string> ignored;
+    // 1. Lister les .ast, tries par nom pour que le melange soit reproductible.
+    struct Found {
+        std::string stem;
+        std::filesystem::path path;
+    };
+    std::vector<Found> found;
     for (const auto& entry : std::filesystem::directory_iterator(musicDir, ec)) {
         if (!entry.is_regular_file()) {
             continue;
         }
-        std::string ext = to_lower(path_to_utf8(entry.path().extension()));
-        if (ext != ".ast") {
+        if (to_lower(path_to_utf8(entry.path().extension())) != ".ast") {
             continue;
         }
-        std::string stem = to_lower(path_to_utf8(entry.path().stem()));
-        if (stem.rfind("z2bgm_", 0) == 0) {
-            stem = stem.substr(6);
-        }
-        auto nameIt = byName.find(stem);
-        if (nameIt == byName.end()) {
-            ignored.push_back(path_to_utf8(entry.path().filename()));
-            cm_log_warn("nom de morceau inconnu, fichier ignore : {}", ignored.back());
-            continue;
-        }
-        if (g_tracks.count(nameIt->second)) {
-            cm_log_warn("deux fichiers pour le meme morceau, ignore : {}", stem);
-            continue;
+        found.push_back({path_to_utf8(entry.path().stem()), entry.path()});
+    }
+    std::sort(found.begin(), found.end(),
+              [](const Found& a, const Found& b) { return to_lower(a.stem) < to_lower(b.stem); });
+
+    // 2. Declarer chaque fichier au jeu ; les noms connus sont "fixes", les autres vont dans la reserve.
+    std::vector<Track*> pool;
+    size_t pinnedCount = 0;
+    for (const Found& fnd : found) {
+        std::string key = to_lower(fnd.stem);
+        if (key.rfind("z2bgm_", 0) == 0) {
+            key = key.substr(6);
         }
 
-        Track& t = g_tracks[nameIt->second];
-        t.name = stem;
-        t.bgmId = nameIt->second;
-        t.file = entry.path();
-        t.discPath = "/Audiores/Stream/custom_" + stem + ".ast";
+        g_files.emplace_back();
+        Track& t = g_files.back();
+        t.name = fnd.stem;
+        t.file = fnd.path;
+        t.discPath = "/Audiores/Stream/custom_" + std::to_string(g_files.size() - 1) + ".ast";
 
         ModResult r = svc_audio_res->add_sound_table_stream(
             mod_ctx, t.discPath.c_str(), nullptr, &t.streamHandle, &t.streamId);
         if (r != MOD_OK) {
-            cm_log_err("add_sound_table_stream a echoue pour {}", stem);
-            g_tracks.erase(nameIt->second);
+            cm_log_err("add_sound_table_stream a echoue pour {}", t.name);
+            g_files.pop_back();
             continue;
         }
-        cm_log("morceau custom pret : {} (stream id {})", stem, t.streamId);
+
+        auto nameIt = byName.find(key);
+        if (nameIt != byName.end() && !g_tracks.count(nameIt->second)) {
+            g_tracks[nameIt->second] = &t;
+            ++pinnedCount;
+            cm_log("morceau fixe : {} -> {}", bgm_name(nameIt->second), t.name);
+        } else {
+            pool.push_back(&t);
+        }
+    }
+
+    // 3. La reserve sera repartie au hasard, par sauvegarde, au premier besoin.
+    g_pool = pool;
+    for (uint32_t id : kZoneIds) {
+        g_zoneSet.insert(id);
+    }
+    {
+        std::ifstream in(dataPath / "seed_force.txt");
+        std::string word;
+        if (in && std::getline(in, word)) {
+            while (!word.empty() && (word.back() == '\r' || word.back() == ' ' || word.back() == '\n')) {
+                word.pop_back();
+            }
+            if (!word.empty()) {
+                // nombre tel quel, sinon empreinte du texte (FNV-1a)
+                bool digits = word.size() < 19;
+                for (char c : word) {
+                    digits = digits && std::isdigit(static_cast<unsigned char>(c));
+                }
+                uint64_t v = 1469598103934665603ull;
+                if (digits) {
+                    v = std::stoull(word);
+                } else {
+                    for (unsigned char c : word) {
+                        v = (v ^ c) * 1099511628211ull;
+                    }
+                }
+                g_forcedSeed = true;
+                g_forcedSeedValue = v == 0 ? 1 : v;
+                cm_log("graine imposee par seed_force.txt : {} ({})", word, g_forcedSeedValue);
+            }
+        }
     }
 
     ModResult result = mods::hook::add_pre<SeqBgmStart>(on_bgm_start_pre);
@@ -433,14 +604,14 @@ MOD_EXPORT ModResult mod_initialize(ModError*) {
 
     g_panelLines.push_back("Dossier des musiques : " + g_musicDirText);
     g_panelLines.push_back("Journal de diagnostic : " + g_logPathText);
-    g_panelLines.push_back("Morceaux detectes : " + std::to_string(g_tracks.size()));
-    for (auto& kv : g_tracks) {
-        g_panelLines.push_back(" - " + kv.second.name);
-    }
-    for (const std::string& name : ignored) {
-        g_panelLines.push_back("Nom inconnu (ignore) : " + name);
-    }
-    g_panelLines.push_back("Ajoute un fichier NOM_DU_MORCEAU.ast dans ce dossier puis relance le jeu.");
+    g_panelLines.push_back("Fichiers .ast trouves : " + std::to_string(g_files.size()));
+    g_panelLines.push_back("Morceaux fixes (nom de fichier = nom du morceau du jeu) : " +
+                           std::to_string(pinnedCount));
+    g_panelLines.push_back("Reserve aleatoire : " + std::to_string(pool.size()) +
+                           " fichier(s), repartis sur les zones du jeu");
+    g_panelLines.push_back(g_forcedSeed
+        ? std::string("Melange : graine imposee par seed_force.txt (identique pour toutes les sauvegardes)")
+        : std::string("Melange : une graine differente par sauvegarde (nouvelle partie = nouveau melange)"));
 
 #if ENABLE_UI_PANEL
     UiModsPanelDesc panel = UI_MODS_PANEL_DESC_INIT;
@@ -448,7 +619,8 @@ MOD_EXPORT ModResult mod_initialize(ModError*) {
     svc_ui->register_mods_panel(mod_ctx, &panel);
 #endif
 
-    cm_log("Custom Music initialise : {} morceau(x)", g_tracks.size());
+    cm_log("Custom Music initialise : {} fichier(s), {} fixe(s), {} dans la reserve", g_files.size(),
+           pinnedCount, pool.size());
     return MOD_OK;
 }
 
@@ -507,11 +679,16 @@ MOD_EXPORT ModResult mod_update(ModError*) {
 MOD_EXPORT ModResult mod_shutdown(ModError*) {
     g_state = State::Idle;  // pas d'appel au jeu ici : il est peut-etre deja ferme
     g_cur = nullptr;
+    g_curBgm = 0;
     g_seq = nullptr;
-    for (auto& kv : g_tracks) {
-        svc_audio_res->remove_sound_table(mod_ctx, kv.second.streamHandle);
+    for (Track& t : g_files) {
+        svc_audio_res->remove_sound_table(mod_ctx, t.streamHandle);
     }
     g_tracks.clear();
+    g_shuffled.clear();
+    g_pool.clear();
+    g_shuffleValid = false;
+    g_files.clear();
     if (g_logFile.is_open()) {
         g_logFile.close();
     }
