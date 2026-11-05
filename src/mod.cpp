@@ -1,7 +1,21 @@
-// Dusklight Custom Music - version 0.1.1 (Corrigée)
+// Dusklight Custom Music - version 0.2 (experimentale, avec journal de diagnostic)
 //
 // Remplace des musiques de fond du jeu (sequences) par tes propres fichiers .ast.
+// Depose tes fichiers dans le dossier "music" du mod (son chemin s'affiche dans
+// le panneau des mods, et dans le journal au demarrage). Le nom du fichier doit
+// etre le nom du morceau du jeu, par exemple FIELD_LINK_DAY.ast
+//
+// Principe :
+//   1. au demarrage, on cherche les .ast du dossier "music" et on les declare
+//      au jeu comme de nouveaux streams (AudioResService) ;
+//   2. quand le jeu demande une musique remplacee (Z2SeqMgr::bgmStart), on
+//      annule la sequence d'origine et on lance a la place la musique en stream
+//      avec le systeme de musique streamee du jeu (bgmStreamPrepare / Play) ;
+//   3. quand le jeu arrete la musique (Z2SeqMgr::bgmStop), on arrete le stream.
 
+// Le jeu redefinit "nullptr" (via global.h, inclus automatiquement), ce qui casse les
+// en-tetes standard de MSVC comme <filesystem>/<chrono>. On les inclut donc en premier,
+// avec cette redefinition mise de cote temporairement.
 #pragma push_macro("nullptr")
 #undef nullptr
 #include <algorithm>
@@ -25,6 +39,9 @@
 // Game includes
 #include "Z2AudioLib/Z2SeqMgr.h"
 
+#include <fmt/format.h>
+
+// Mettre 0 si la compilation echoue a cause du panneau d'interface.
 #define ENABLE_UI_PANEL 1
 
 DEFINE_MOD();
@@ -98,10 +115,16 @@ static std::string to_lower(std::string s) {
 
 static const char* bgm_name(uint32_t id) {
     for (const BgmName& b : kBgmNames) {
-        if (b.id == id) return b.name;
+        if (b.id == id) {
+            return b.name;
+        }
     }
     return "?";
 }
+
+// ---------------------------------------------------------------------------
+// Chemins (UTF-8 -> std::filesystem, pour les noms d'utilisateur avec accents)
+// ---------------------------------------------------------------------------
 
 static std::filesystem::path path_from_utf8(const char* s) {
 #if defined(__cpp_char8_t)
@@ -120,117 +143,190 @@ static std::string path_to_utf8(const std::filesystem::path& p) {
 #endif
 }
 
+// ---------------------------------------------------------------------------
+// Etat du mod
+// ---------------------------------------------------------------------------
+
 struct Track {
-    std::string name;
-    uint32_t bgmId = 0;
+    std::string name;       // ex: FIELD_LINK_DAY
+    uint32_t bgmId = 0;     // ex: Z2BGM_FIELD_LINK_DAY
     std::filesystem::path file;
-    std::string discPath;
-    uint16_t streamId = 0;
+    std::string discPath;   // chemin virtuel donne au jeu
+    uint16_t streamId = 0;  // ID attribue par AudioResService
     AudioSoundTableHandle streamHandle = 0;
-    bool loaded = false;
+    bool loaded = false;    // le fichier a deja ete envoye au jeu (overlay)
+    bool failed = false;    // le stream n'a pas demarre : on laisse la musique d'origine
 };
 
 enum class State { Idle, Loading, Preparing, Playing };
 
-static std::unordered_map<uint32_t, Track> g_tracks;
+static std::unordered_map<uint32_t, Track> g_tracks;  // cle = ID de la musique du jeu
 static State g_state = State::Idle;
 static Track* g_cur = nullptr;
-static int g_loadWait = 0;
-static int g_prepareTimeout = 0;
-static bool g_internal = false;
+static int g_wait = 0;
+static bool g_internal = false;  // vrai quand c'est NOUS qui appelons bgmStop
 static std::string g_musicDirText;
 static std::vector<std::string> g_panelLines;
+static std::ofstream g_logFile;
+static std::string g_logPathText;
+
+// Journal : ecrit dans le journal de Dusklight ET dans custom_music_log.txt
+// (a cote du dossier "music"), pour pouvoir me l'envoyer facilement.
+static void emit_log(int level, const std::string& text) {
+    if (level == 2) {
+        mods::log::error("{}", text);
+    } else if (level == 1) {
+        mods::log::warn("{}", text);
+    } else {
+        mods::log::info("{}", text);
+    }
+    if (g_logFile.is_open()) {
+        g_logFile << (level == 2 ? "ERREUR: " : level == 1 ? "ATTENTION: " : "") << text << "\n";
+        g_logFile.flush();
+    }
+}
+
+template <typename... Args>
+static void cm_log(fmt::format_string<Args...> f, Args&&... args) {
+    emit_log(0, fmt::format(f, std::forward<Args>(args)...));
+}
+template <typename... Args>
+static void cm_log_warn(fmt::format_string<Args...> f, Args&&... args) {
+    emit_log(1, fmt::format(f, std::forward<Args>(args)...));
+}
+template <typename... Args>
+static void cm_log_err(fmt::format_string<Args...> f, Args&&... args) {
+    emit_log(2, fmt::format(f, std::forward<Args>(args)...));
+}
 
 static uint32_t stream_sound_id(const Track& t) {
+    // JAISoundID : section 2 (musique streamee), groupe 0, puis l'ID du stream.
     return (2u << 24) | t.streamId;
 }
 
+// Envoie le fichier .ast au jeu (en memoire). Fait une seule fois par morceau.
 static bool ensure_loaded(Track& t) {
     if (t.loaded) {
-        g_loadWait = 0;
+        g_wait = 0;
         return true;
     }
     std::ifstream f(t.file, std::ios::binary | std::ios::ate);
     if (!f) {
-        mods::log::error("impossible d'ouvrir {}", path_to_utf8(t.file));
+        cm_log_err("impossible d'ouvrir {}", path_to_utf8(t.file));
         return false;
     }
     std::streamsize size = f.tellg();
     f.seekg(0, std::ios::beg);
     std::vector<uint8_t> buf(static_cast<size_t>(size));
     if (size > 0 && !f.read(reinterpret_cast<char*>(buf.data()), size)) {
-        mods::log::error("erreur de lecture de {}", path_to_utf8(t.file));
+        cm_log_err("erreur de lecture de {}", path_to_utf8(t.file));
         return false;
     }
     ModResult r = svc_overlay->add_buffer(mod_ctx, t.discPath.c_str(), buf.data(), buf.size(), nullptr);
     if (r != MOD_OK) {
-        mods::log::error("overlay add_buffer a echoue pour {}", t.name);
+        cm_log_err("overlay add_buffer a echoue pour {}", t.name);
         return false;
     }
     t.loaded = true;
-    g_loadWait = 3; // On laisse le temps à l'overlay de s'enregistrer proprement
+    g_wait = 3;  // l'overlay est applique au prochain "frame boundary" : on attend un peu
     return true;
 }
 
+// Le stream n'a pas demarre : on rend la main a la musique d'origine.
+static void fail_custom(Z2SeqMgr* seq, const char* why) {
+    Track* t = g_cur;
+    g_state = State::Idle;
+    g_cur = nullptr;
+    if (t == nullptr) {
+        return;
+    }
+    cm_log_err("echec de la musique custom {} : {} -> retour a la musique d'origine", t->name, why);
+    seq->bgmStreamStop(0);
+    t->failed = true;
+    g_internal = true;
+    seq->bgmStart(t->bgmId, 0, 0);
+    g_internal = false;
+}
+
 static void stop_custom(uint32_t fadeTime) {
-    if (g_state == State::Idle) return;
+    if (g_state == State::Idle) {
+        return;
+    }
     if (g_state == State::Preparing || g_state == State::Playing) {
         if (Z2SeqMgr* seq = Z2GetSeqMgr()) {
             seq->bgmStreamStop(fadeTime);
         }
     }
-    mods::log::info("musique custom arretee ({})", g_cur ? g_cur->name : std::string("?"));
+    cm_log("musique custom arretee ({})", g_cur ? g_cur->name : std::string("?"));
     g_state = State::Idle;
     g_cur = nullptr;
-    g_loadWait = 0;
-    g_prepareTimeout = 0;
 }
 
+// ---------------------------------------------------------------------------
 // Hooks
+// ---------------------------------------------------------------------------
+
 static HookAction on_bgm_start_pre(ModContext*, void* args, void*, void*) {
-    if (g_internal) return HOOK_CONTINUE;
+    if (g_internal) {
+        return HOOK_CONTINUE;
+    }
     Z2SeqMgr* seq = mods::arg<Z2SeqMgr*>(args, 0);
     uint32_t bgmId = mods::arg<uint32_t>(args, 1);
     uint32_t fade = mods::arg<uint32_t>(args, 2);
+    cm_log("bgmStart id=0x{:X} nom={} fondu={}", bgmId, bgm_name(bgmId), fade);
 
     auto it = g_tracks.find(bgmId);
     if (it == g_tracks.end()) {
+        // Musique non remplacee : on coupe la notre si elle joue, le jeu fait le reste.
         stop_custom(fade);
         return HOOK_CONTINUE;
     }
+    if (it->second.failed) {
+        return HOOK_CONTINUE;  // ce morceau n'a pas marche : musique d'origine
+    }
     if (g_cur == &it->second && g_state != State::Idle) {
-        return HOOK_SKIP_ORIGINAL;
+        return HOOK_SKIP_ORIGINAL;  // deja en train de jouer
     }
     if (!ensure_loaded(it->second)) {
-        return HOOK_CONTINUE;
+        return HOOK_CONTINUE;  // probleme de fichier : la musique d'origine joue
     }
 
     stop_custom(fade);
     g_internal = true;
-    seq->bgmStop(fade, 0);
+    seq->bgmStop(fade, 0);  // coupe la sequence d'origine eventuellement en cours
     g_internal = false;
 
     g_cur = &it->second;
     g_state = State::Loading;
-    g_prepareTimeout = 0;
-    mods::log::info("musique custom demandee : {}", it->second.name);
-    return HOOK_SKIP_ORIGINAL;
+    cm_log("musique custom demandee : {}", it->second.name);
+    return HOOK_SKIP_ORIGINAL;  // on n'ouvre pas la sequence d'origine
 }
 
 static HookAction on_bgm_stop_pre(ModContext*, void* args, void*, void*) {
-    if (g_internal) return HOOK_CONTINUE;
+    if (g_internal) {
+        return HOOK_CONTINUE;
+    }
     uint32_t fade = mods::arg<uint32_t>(args, 1);
+    cm_log("bgmStop fondu={}", fade);
     stop_custom(fade);
     return HOOK_CONTINUE;
 }
 
 static void on_check_bgm_playing_post(ModContext*, void* args, void* retval, void*) {
-    if (g_state == State::Idle || g_cur == nullptr || retval == nullptr) return;
+    // Le jeu demande souvent "est-ce que cette musique joue deja ?". Pour nos
+    // morceaux, on repond oui, sinon il relancerait la musique en boucle.
+    if (g_state == State::Idle || g_cur == nullptr || retval == nullptr) {
+        return;
+    }
     uint32_t bgmId = mods::arg<uint32_t>(args, 1);
     if (bgmId == g_cur->bgmId) {
         *static_cast<bool*>(retval) = true;
     }
 }
+
+// ---------------------------------------------------------------------------
+// Panneau dans le menu des mods
+// ---------------------------------------------------------------------------
 
 #if ENABLE_UI_PANEL
 static ModResult build_panel(ModContext*, UiElementHandle panel, void*, ModError*) {
@@ -243,16 +339,30 @@ static ModResult build_panel(ModContext*, UiElementHandle panel, void*, ModError
 }
 #endif
 
+// ---------------------------------------------------------------------------
+// Cycle de vie du mod
+// ---------------------------------------------------------------------------
+
 extern "C" {
 MOD_EXPORT ModResult mod_initialize(ModError*) {
     const char* dataDir = nullptr;
-    if (svc_host->data_dir(mod_ctx, &dataDir) != MOD_OK || dataDir == nullptr) return MOD_ERROR;
+    if (svc_host->data_dir(mod_ctx, &dataDir) != MOD_OK || dataDir == nullptr) {
+        cm_log_err("impossible d'obtenir le dossier de donnees du mod");
+        return MOD_ERROR;
+    }
+
+    std::filesystem::path logPath = path_from_utf8(dataDir) / "custom_music_log.txt";
+    g_logPathText = path_to_utf8(logPath);
+    g_logFile.open(logPath, std::ios::out | std::ios::trunc);
+    cm_log("Custom Music v0.2 : demarrage");
 
     std::filesystem::path musicDir = path_from_utf8(dataDir) / "music";
     std::error_code ec;
     std::filesystem::create_directories(musicDir, ec);
     g_musicDirText = path_to_utf8(musicDir);
+    cm_log("dossier des musiques : {}", g_musicDirText);
 
+    // Table nom (en minuscules) -> ID de musique.
     std::unordered_map<std::string, uint32_t> byName;
     for (const BgmName& b : kBgmNames) {
         byName[to_lower(b.name)] = b.id;
@@ -260,18 +370,27 @@ MOD_EXPORT ModResult mod_initialize(ModError*) {
 
     std::vector<std::string> ignored;
     for (const auto& entry : std::filesystem::directory_iterator(musicDir, ec)) {
-        if (!entry.is_regular_file()) continue;
+        if (!entry.is_regular_file()) {
+            continue;
+        }
         std::string ext = to_lower(path_to_utf8(entry.path().extension()));
-        if (ext != ".ast") continue;
+        if (ext != ".ast") {
+            continue;
+        }
         std::string stem = to_lower(path_to_utf8(entry.path().stem()));
-        if (stem.rfind("z2bgm_", 0) == 0) stem = stem.substr(6);
-
+        if (stem.rfind("z2bgm_", 0) == 0) {
+            stem = stem.substr(6);
+        }
         auto nameIt = byName.find(stem);
         if (nameIt == byName.end()) {
             ignored.push_back(path_to_utf8(entry.path().filename()));
+            cm_log_warn("nom de morceau inconnu, fichier ignore : {}", ignored.back());
             continue;
         }
-        if (g_tracks.count(nameIt->second)) continue;
+        if (g_tracks.count(nameIt->second)) {
+            cm_log_warn("deux fichiers pour le meme morceau, ignore : {}", stem);
+            continue;
+        }
 
         Track& t = g_tracks[nameIt->second];
         t.name = stem;
@@ -282,51 +401,94 @@ MOD_EXPORT ModResult mod_initialize(ModError*) {
         ModResult r = svc_audio_res->add_sound_table_stream(
             mod_ctx, t.discPath.c_str(), nullptr, &t.streamHandle, &t.streamId);
         if (r != MOD_OK) {
+            cm_log_err("add_sound_table_stream a echoue pour {}", stem);
             g_tracks.erase(nameIt->second);
             continue;
         }
+        cm_log("morceau custom pret : {} (stream id {})", stem, t.streamId);
     }
 
-    mods::hook::add_pre<SeqBgmStart>(on_bgm_start_pre);
-    mods::hook::add_pre<SeqBgmStop>(on_bgm_stop_pre);
-    mods::hook::add_post<SeqCheckBgmIDPlaying>(on_check_bgm_playing_post);
+    ModResult result = mods::hook::add_pre<SeqBgmStart>(on_bgm_start_pre);
+    if (result != MOD_OK) {
+        cm_log_err("echec du hook bgmStart");
+        return result;
+    }
+    result = mods::hook::add_pre<SeqBgmStop>(on_bgm_stop_pre);
+    if (result != MOD_OK) {
+        cm_log_err("echec du hook bgmStop");
+        return result;
+    }
+    result = mods::hook::add_post<SeqCheckBgmIDPlaying>(on_check_bgm_playing_post);
+    if (result != MOD_OK) {
+        cm_log_err("echec du hook checkBgmIDPlaying");
+        return result;
+    }
 
-    g_panelLines.push_back("Dossier : " + g_musicDirText);
+    g_panelLines.push_back("Dossier des musiques : " + g_musicDirText);
+    g_panelLines.push_back("Journal de diagnostic : " + g_logPathText);
     g_panelLines.push_back("Morceaux detectes : " + std::to_string(g_tracks.size()));
+    for (auto& kv : g_tracks) {
+        g_panelLines.push_back(" - " + kv.second.name);
+    }
+    for (const std::string& name : ignored) {
+        g_panelLines.push_back("Nom inconnu (ignore) : " + name);
+    }
+    g_panelLines.push_back("Ajoute un fichier NOM_DU_MORCEAU.ast dans ce dossier puis relance le jeu.");
 
 #if ENABLE_UI_PANEL
     UiModsPanelDesc panel = UI_MODS_PANEL_DESC_INIT;
     panel.build = build_panel;
     svc_ui->register_mods_panel(mod_ctx, &panel);
 #endif
+
+    cm_log("Custom Music initialise : {} morceau(x)", g_tracks.size());
     return MOD_OK;
 }
 
 MOD_EXPORT ModResult mod_update(ModError*) {
-    if (g_state == State::Idle || g_cur == nullptr) return MOD_OK;
+    if (g_state == State::Idle || g_cur == nullptr) {
+        return MOD_OK;
+    }
     Z2SeqMgr* seq = Z2GetSeqMgr();
-    if (seq == nullptr) return MOD_OK;
+    if (seq == nullptr) {
+        return MOD_OK;
+    }
 
     switch (g_state) {
     case State::Loading:
-        if (g_loadWait > 0) {
-            g_loadWait--;
-            break;
+        if (--g_wait <= 0) {
+            uint32_t sid = stream_sound_id(*g_cur);
+            seq->bgmStreamPrepare(sid);
+            cm_log("bgmStreamPrepare(0x{:X}) appele ; id du stream actif = 0x{:X}", sid,
+                 static_cast<uint32_t>(seq->getStreamBgmID()));
+            g_state = State::Preparing;
+            g_wait = 0;
         }
-        seq->bgmStreamPrepare(stream_sound_id(*g_cur));
-        g_state = State::Preparing;
-        g_prepareTimeout = 0;
         break;
-
     case State::Preparing:
         if (seq->bgmStreamCheckReady()) {
             seq->bgmStreamPlay();
+            cm_log("bgmStreamPlay appele ; id du stream actif = 0x{:X}",
+                 static_cast<uint32_t>(seq->getStreamBgmID()));
             g_state = State::Playing;
-            mods::log::info("musique custom en lecture : {}", g_cur->name);
-        } else if (++g_prepareTimeout > 900) {
-            mods::log::error("le stream {} n'est jamais devenu pret (abandon)", g_cur->name);
-            g_state = State::Idle;
-            g_cur = nullptr;
+            g_wait = 0;
+        } else {
+            ++g_wait;
+            if (g_wait % 60 == 0) {
+                cm_log("en attente du stream... {} images, id du stream actif = 0x{:X}", g_wait,
+                     static_cast<uint32_t>(seq->getStreamBgmID()));
+            }
+            if (g_wait > 300) {
+                fail_custom(seq, "le stream n'est jamais devenu pret");
+            }
+        }
+        break;
+    case State::Playing:
+        ++g_wait;
+        if (g_wait == 60 || g_wait == 300) {
+            cm_log("{} images apres le lancement : musique en cours = {}, id du stream actif = 0x{:X}",
+                 g_wait, static_cast<bool>(seq->checkBgmPlaying()),
+                 static_cast<uint32_t>(seq->getStreamBgmID()));
         }
         break;
     default:
@@ -341,6 +503,9 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
         svc_audio_res->remove_sound_table(mod_ctx, kv.second.streamHandle);
     }
     g_tracks.clear();
+    if (g_logFile.is_open()) {
+        g_logFile.close();
+    }
     return MOD_OK;
 }
 }
