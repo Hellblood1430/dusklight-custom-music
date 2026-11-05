@@ -1,0 +1,29 @@
+name: Build converter
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'converter/**'
+      - '.github/workflows/build-converter.yml'
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install tools
+        run: pip install pyinstaller imageio-ffmpeg
+
+      - name: Build the portable app
+        run: pyinstaller --onefile --windowed --collect-all imageio_ffmpeg --name ConvertisseurMusiqueDusklight converter/convertisseur.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ConvertisseurMusiqueDusklight
+          path: dist/ConvertisseurMusiqueDusklight.exe
