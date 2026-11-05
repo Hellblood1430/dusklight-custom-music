@@ -1,4 +1,4 @@
-// Dusklight Custom Music - version 0.2 (experimentale, avec journal de diagnostic)
+// Dusklight Custom Music - version 0.3 (experimentale, avec journal de diagnostic)
 //
 // Remplace des musiques de fond du jeu (sequences) par tes propres fichiers .ast.
 // Depose tes fichiers dans le dossier "music" du mod (son chemin s'affiche dans
@@ -165,6 +165,10 @@ static State g_state = State::Idle;
 static Track* g_cur = nullptr;
 static int g_wait = 0;
 static bool g_internal = false;  // vrai quand c'est NOUS qui appelons bgmStop
+// Z2GetSeqMgr() ne fonctionne pas depuis un mod (chaque DLL a sa propre copie de la
+// variable globale, qui reste vide). On garde donc le pointeur que le jeu nous donne
+// lui-meme dans les hooks.
+static Z2SeqMgr* g_seq = nullptr;
 static std::string g_musicDirText;
 static std::vector<std::string> g_panelLines;
 static std::ofstream g_logFile;
@@ -253,7 +257,7 @@ static void stop_custom(uint32_t fadeTime) {
         return;
     }
     if (g_state == State::Preparing || g_state == State::Playing) {
-        if (Z2SeqMgr* seq = Z2GetSeqMgr()) {
+        if (Z2SeqMgr* seq = g_seq) {
             seq->bgmStreamStop(fadeTime);
         }
     }
@@ -267,10 +271,11 @@ static void stop_custom(uint32_t fadeTime) {
 // ---------------------------------------------------------------------------
 
 static HookAction on_bgm_start_pre(ModContext*, void* args, void*, void*) {
+    Z2SeqMgr* seq = mods::arg<Z2SeqMgr*>(args, 0);
+    g_seq = seq;
     if (g_internal) {
         return HOOK_CONTINUE;
     }
-    Z2SeqMgr* seq = mods::arg<Z2SeqMgr*>(args, 0);
     uint32_t bgmId = mods::arg<uint32_t>(args, 1);
     uint32_t fade = mods::arg<uint32_t>(args, 2);
     cm_log("bgmStart id=0x{:X} nom={} fondu={}", bgmId, bgm_name(bgmId), fade);
@@ -303,6 +308,7 @@ static HookAction on_bgm_start_pre(ModContext*, void* args, void*, void*) {
 }
 
 static HookAction on_bgm_stop_pre(ModContext*, void* args, void*, void*) {
+    g_seq = mods::arg<Z2SeqMgr*>(args, 0);
     if (g_internal) {
         return HOOK_CONTINUE;
     }
@@ -315,6 +321,7 @@ static HookAction on_bgm_stop_pre(ModContext*, void* args, void*, void*) {
 static void on_check_bgm_playing_post(ModContext*, void* args, void* retval, void*) {
     // Le jeu demande souvent "est-ce que cette musique joue deja ?". Pour nos
     // morceaux, on repond oui, sinon il relancerait la musique en boucle.
+    g_seq = mods::arg<Z2SeqMgr*>(args, 0);
     if (g_state == State::Idle || g_cur == nullptr || retval == nullptr) {
         return;
     }
@@ -354,7 +361,7 @@ MOD_EXPORT ModResult mod_initialize(ModError*) {
     std::filesystem::path logPath = path_from_utf8(dataDir) / "custom_music_log.txt";
     g_logPathText = path_to_utf8(logPath);
     g_logFile.open(logPath, std::ios::out | std::ios::trunc);
-    cm_log("Custom Music v0.2 : demarrage");
+    cm_log("Custom Music v0.3 : demarrage");
 
     std::filesystem::path musicDir = path_from_utf8(dataDir) / "music";
     std::error_code ec;
@@ -449,7 +456,7 @@ MOD_EXPORT ModResult mod_update(ModError*) {
     if (g_state == State::Idle || g_cur == nullptr) {
         return MOD_OK;
     }
-    Z2SeqMgr* seq = Z2GetSeqMgr();
+    Z2SeqMgr* seq = g_seq;
     if (seq == nullptr) {
         return MOD_OK;
     }
@@ -498,7 +505,9 @@ MOD_EXPORT ModResult mod_update(ModError*) {
 }
 
 MOD_EXPORT ModResult mod_shutdown(ModError*) {
-    stop_custom(0);
+    g_state = State::Idle;  // pas d'appel au jeu ici : il est peut-etre deja ferme
+    g_cur = nullptr;
+    g_seq = nullptr;
     for (auto& kv : g_tracks) {
         svc_audio_res->remove_sound_table(mod_ctx, kv.second.streamHandle);
     }
