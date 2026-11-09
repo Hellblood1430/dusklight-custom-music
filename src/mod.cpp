@@ -1,4 +1,4 @@
-// Dusklight Custom Music - version 0.6 (experimentale, melange aleatoire par sauvegarde)
+// Dusklight Custom Music - version 0.7 (experimentale, melange aleatoire par sauvegarde)
 //
 // Remplace des musiques de fond du jeu (sequences) par tes propres fichiers .ast.
 //
@@ -27,6 +27,7 @@
 #undef nullptr
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstdint>
 #include <deque>
 #include <filesystem>
@@ -186,6 +187,7 @@ struct Track {
     bool loaded = false;    // le fichier a deja ete envoye au jeu (overlay)
     bool failed = false;    // trop d'echecs : on laisse la musique d'origine
     int failCount = 0;
+    double durationSec = 0; // duree du morceau, lue dans l'en-tete du .ast
 };
 
 enum class State { Idle, Loading, Preparing, Playing };
@@ -205,7 +207,8 @@ static uint64_t g_forcedSeedValue = 0;
 static State g_state = State::Idle;
 static Track* g_cur = nullptr;
 static int g_wait = 0;
-static int g_restarts = 0;  // relances automatiques du stream pour la musique en cours
+static int g_quickDeaths = 0;  // le stream s'est arrete moins de 3 s apres son lancement, plusieurs fois de suite
+static std::chrono::steady_clock::time_point g_startTime;  // debut de la lecture en cours
 static bool g_internal = false;  // vrai quand c'est NOUS qui appelons bgmStop
 // Z2GetSeqMgr() ne fonctionne pas depuis un mod (chaque DLL a sa propre copie de la
 // variable globale, qui reste vide). On garde donc le pointeur que le jeu nous donne
@@ -293,9 +296,9 @@ static void fail_custom(Z2SeqMgr* seq, const char* why) {
     seq->bgmStreamStop(0);
     seq->bgmStart(bgm, 0, 0);  // la musique d'origine reprend
     g_internal = false;
-    if (++t->failCount >= 3) {
+    if (++t->failCount >= 2) {
         t->failed = true;
-        cm_log_err("{} a echoue 3 fois : musique d'origine pour le reste de la session", t->name);
+        cm_log_err("{} a echoue 2 fois : musique d'origine pour le reste de la session", t->name);
     }
 }
 
@@ -436,7 +439,7 @@ static HookAction on_bgm_start_pre(ModContext*, void* args, void*, void*) {
 
     g_cur = track;
     g_curBgm = bgmId;
-    g_restarts = 0;
+    g_quickDeaths = 0;
     g_state = State::Loading;
     cm_log("musique custom demandee : {} (pour {})", track->name, bgm_name(bgmId));
     return HOOK_SKIP_ORIGINAL;  // on n'ouvre pas la sequence d'origine
@@ -459,17 +462,13 @@ static HookAction on_stream_stop_pre(ModContext*, void* args, void*, void*) {
     if (g_internal || g_state == State::Idle || g_cur == nullptr) {
         return HOOK_CONTINUE;
     }
-    // Le jeu coupe "par precaution" le stream (par ex. a un changement de zone), ce qui
-    // tuerait notre musique sans qu'il la relance. Si le stream actif est le notre (ou
-    // pas encore attache), on ignore cet arret. S'il appartient a autre chose (une
-    // cinematique, par ex.), on laisse faire.
-    uint32_t active = static_cast<uint32_t>(seq->getStreamBgmID());
-    if (active != 0xFFFFFFFFu && active != stream_sound_id(*g_cur)) {
-        return HOOK_CONTINUE;
-    }
+    // Le jeu coupe le stream lui-meme. On le laisse faire (il a peut-etre besoin du
+    // stream pour autre chose) : la surveillance s'occupera de relancer notre musique
+    // si plus personne n'utilise le stream.
     uint32_t fade = mods::arg<uint32_t>(args, 1);
-    cm_log("bgmStreamStop du jeu ignore (fondu={}) : notre musique {} continue", fade, g_cur->name);
-    return HOOK_SKIP_ORIGINAL;
+    cm_log("bgmStreamStop du jeu (fondu={}) pendant {} ; stream actif = 0x{:X}", fade, g_cur->name,
+           static_cast<uint32_t>(seq->getStreamBgmID()));
+    return HOOK_CONTINUE;
 }
 
 static void on_check_bgm_playing_post(ModContext*, void* args, void* retval, void*) {
@@ -516,7 +515,7 @@ MOD_EXPORT ModResult mod_initialize(ModError*) {
     std::filesystem::path logPath = dataPath / "custom_music_log.txt";
     g_logPathText = path_to_utf8(logPath);
     g_logFile.open(logPath, std::ios::out | std::ios::trunc);
-    cm_log("Custom Music v0.6 : demarrage");
+    cm_log("Custom Music v0.7 : demarrage");
 
     std::filesystem::path musicDir = dataPath / "music";
     std::error_code ec;
@@ -569,6 +568,23 @@ MOD_EXPORT ModResult mod_initialize(ModError*) {
             cm_log_err("add_sound_table_stream a echoue pour {}", t.name);
             g_files.pop_back();
             continue;
+        }
+
+        {
+            std::ifstream hf(t.file, std::ios::binary);
+            unsigned char h[0x20] = {};
+            if (hf.read(reinterpret_cast<char*>(h), sizeof(h))) {
+                auto be32 = [&](int o) {
+                    return (static_cast<uint32_t>(h[o]) << 24) | (static_cast<uint32_t>(h[o + 1]) << 16) |
+                           (static_cast<uint32_t>(h[o + 2]) << 8) | static_cast<uint32_t>(h[o + 3]);
+                };
+                uint32_t rate = be32(0x10);
+                uint32_t total = be32(0x14);
+                if (rate > 0) {
+                    t.durationSec = static_cast<double>(total) / rate;
+                }
+            }
+            cm_log("fichier : {} ({:.0f} s)", t.name, t.durationSec);
         }
 
         auto nameIt = byName.find(key);
@@ -684,6 +700,7 @@ MOD_EXPORT ModResult mod_update(ModError*) {
                  static_cast<uint32_t>(seq->getStreamBgmID()));
             g_state = State::Playing;
             g_wait = 0;
+            g_startTime = std::chrono::steady_clock::now();
         } else {
             ++g_wait;
             if (g_wait % 60 == 0) {
@@ -704,15 +721,22 @@ MOD_EXPORT ModResult mod_update(ModError*) {
                    g_wait, static_cast<bool>(seq->checkBgmPlaying()), active);
         }
         // Surveillance : le stream est-il toujours le notre ?
-        if (g_wait > 45 && g_wait % 15 == 0 && active != mine) {
+        if (g_wait > 20 && active != mine) {
+            double elapsed =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - g_startTime).count();
             if (active == 0xFFFFFFFFu) {
-                if (g_restarts < 3) {
-                    ++g_restarts;
-                    cm_log_warn("le stream s'est arrete tout seul -> relance ({}/3)", g_restarts);
+                // Le stream est termine ou a ete coupe. On le relance (c'est notre "boucle"),
+                // sauf s'il meurt tout de suite plusieurs fois de suite : la, c'est un vrai probleme.
+                bool natural = g_cur->durationSec > 0 && elapsed >= g_cur->durationSec - 2.0;
+                cm_log("{} {} apres {:.1f} s (duree du morceau : {:.1f} s) -> relance",
+                       natural ? "fin du morceau" : "interruption de", g_cur->name, elapsed,
+                       g_cur->durationSec);
+                g_quickDeaths = elapsed < 3.0 ? g_quickDeaths + 1 : 0;
+                if (g_quickDeaths >= 3) {
+                    fail_custom(seq, "le stream s'arrete immediatement, a chaque relance");
+                } else {
                     g_state = State::Loading;
                     g_wait = 0;
-                } else {
-                    fail_custom(seq, "le stream s'arrete sans cesse");
                 }
             } else {
                 cm_log_warn("un autre stream (0x{:X}) a pris la place de {}", active, g_cur->name);
