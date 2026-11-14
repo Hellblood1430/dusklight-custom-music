@@ -1,4 +1,4 @@
-// Dusklight Custom Music - version 0.7 (experimentale, melange aleatoire par sauvegarde)
+// Dusklight Custom Music - version 0.9 (experimentale, melange aleatoire par sauvegarde)
 //
 // Remplace des musiques de fond du jeu (sequences) par tes propres fichiers .ast.
 //
@@ -29,6 +29,8 @@
 #include <cctype>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
+#include <cmath>
 #include <deque>
 #include <filesystem>
 #include <fstream>
@@ -72,6 +74,12 @@ DEFINE_HOOK(&Z2SeqMgr::bgmStart, SeqBgmStart);
 DEFINE_HOOK(&Z2SeqMgr::bgmStop, SeqBgmStop);
 DEFINE_HOOK(&Z2SeqMgr::checkBgmIDPlaying, SeqCheckBgmIDPlaying);
 DEFINE_HOOK(&Z2SeqMgr::bgmStreamStop, SeqBgmStreamStop);
+// Hooks de diagnostic : ils ne changent rien, ils notent seulement ce que fait le jeu (combats...).
+DEFINE_HOOK(&Z2SeqMgr::startBattleBgm, SeqStartBattleBgm);
+DEFINE_HOOK(&Z2SeqMgr::stopBattleBgm, SeqStopBattleBgm);
+DEFINE_HOOK(&Z2SeqMgr::subBgmStart, SeqSubBgmStart);
+DEFINE_HOOK(&Z2SeqMgr::subBgmStop, SeqSubBgmStop);
+DEFINE_HOOK(&Z2SeqMgr::changeBgmStatus, SeqChangeBgmStatus);
 
 // ---------------------------------------------------------------------------
 // Noms des musiques du jeu (enum Z2BgmID de Z2SeqMgr.h)
@@ -188,6 +196,7 @@ struct Track {
     bool failed = false;    // trop d'echecs : on laisse la musique d'origine
     int failCount = 0;
     double durationSec = 0; // duree du morceau, lue dans l'en-tete du .ast
+    OverlayHandle overlay = 0;  // enregistrement de l'overlay du fichier complet
 };
 
 enum class State { Idle, Loading, Preparing, Playing };
@@ -209,6 +218,24 @@ static Track* g_cur = nullptr;
 static int g_wait = 0;
 static int g_quickDeaths = 0;  // le stream s'est arrete moins de 3 s apres son lancement, plusieurs fois de suite
 static std::chrono::steady_clock::time_point g_startTime;  // debut de la lecture en cours
+static float g_lastVol[5] = {-1.f, -1.f, -1.f, -1.f, -1.f};  // derniers volumes journalises
+
+// Reprise de la musique la ou elle s'est arretee : quand le jeu coupe le stream (changement
+// de salle...), on prepare un fichier "reprise" qui commence a la bonne position. Deux
+// emplacements en alternance, pour ne jamais toucher a un fichier que le jeu pourrait
+// encore tenir ouvert.
+static const char* kResumePath[2] = {"/Audiores/Stream/custom_resume_a.ast",
+                                     "/Audiores/Stream/custom_resume_b.ast"};
+static uint16_t g_resumeStreamId[2] = {0, 0};
+static AudioSoundTableHandle g_resumeStreamHandle[2] = {0, 0};
+static OverlayHandle g_resumeOverlay[2] = {0, 0};
+static int g_resumeSlot = 0;          // emplacement du fichier de reprise en cours
+static bool g_resumeAvailable = false;
+static bool g_resumeDisabled = false; // la reprise a echoue pour cette musique
+static bool g_playingResume = false;  // le stream en cours est un fichier de reprise (sans boucle)
+static double g_posBase = 0;          // position (s) dans le morceau au debut de la lecture en cours
+static double g_tailSec = 0;          // duree du fichier de reprise en cours
+static std::deque<Track*> g_loadedOrder;  // morceaux charges en memoire, du plus ancien au plus recent
 static bool g_internal = false;  // vrai quand c'est NOUS qui appelons bgmStop
 // Z2GetSeqMgr() ne fonctionne pas depuis un mod (chaque DLL a sa propre copie de la
 // variable globale, qui reste vide). On garde donc le pointeur que le jeu nous donne
@@ -253,35 +280,153 @@ static uint32_t stream_sound_id(const Track& t) {
     return (2u << 24) | t.streamId;
 }
 
+// ID du stream qu'on s'attend a voir actif : le fichier de reprise ou le morceau complet.
+static uint32_t current_sound_id(const Track& t) {
+    if (g_playingResume) {
+        return (2u << 24) | g_resumeStreamId[g_resumeSlot];
+    }
+    return stream_sound_id(t);
+}
+
+static bool read_all(const std::filesystem::path& p, std::vector<uint8_t>& out) {
+    std::ifstream f(p, std::ios::binary | std::ios::ate);
+    if (!f) {
+        return false;
+    }
+    std::streamsize size = f.tellg();
+    f.seekg(0, std::ios::beg);
+    out.resize(static_cast<size_t>(size));
+    return size == 0 || static_cast<bool>(f.read(reinterpret_cast<char*>(out.data()), size));
+}
+
+static uint32_t rd32(const uint8_t* p) {
+    return (static_cast<uint32_t>(p[0]) << 24) | (static_cast<uint32_t>(p[1]) << 16) |
+           (static_cast<uint32_t>(p[2]) << 8) | static_cast<uint32_t>(p[3]);
+}
+
+static void wr32(uint8_t* p, uint32_t v) {
+    p[0] = static_cast<uint8_t>(v >> 24);
+    p[1] = static_cast<uint8_t>(v >> 16);
+    p[2] = static_cast<uint8_t>(v >> 8);
+    p[3] = static_cast<uint8_t>(v);
+}
+
+// Construit un .ast qui commence au bloc contenant la position posSec (sans boucle).
+static bool make_resume_ast(const std::vector<uint8_t>& ast, double posSec, std::vector<uint8_t>& out,
+                            double& startSec, double& tailSec) {
+    if (ast.size() < 0x40 || std::memcmp(ast.data(), "STRM", 4) != 0) {
+        return false;
+    }
+    uint16_t format = static_cast<uint16_t>((ast[8] << 8) | ast[9]);
+    uint16_t channels = static_cast<uint16_t>((ast[0x0C] << 8) | ast[0x0D]);
+    uint32_t rate = rd32(&ast[0x10]);
+    uint32_t total = rd32(&ast[0x14]);
+    uint32_t blockBytes = rd32(&ast[0x20]);
+    if (format != 1 || channels != 2 || rate == 0 || blockBytes < 2) {
+        return false;
+    }
+    const uint32_t spb = blockBytes / 2;  // echantillons par bloc et par canal
+    const size_t stride = 0x20 + 2 * static_cast<size_t>(blockBytes);
+    const uint32_t numBlocks = (total + spb - 1) / spb;
+    uint32_t k = static_cast<uint32_t>(posSec * rate / spb);
+    if (k == 0 || k >= numBlocks) {
+        return false;
+    }
+    size_t off = 0x40 + static_cast<size_t>(k) * stride;
+    if (off + 0x20 >= ast.size()) {
+        return false;
+    }
+    uint32_t newTotal = total - k * spb;
+    out.assign(ast.begin(), ast.begin() + 0x40);
+    out.insert(out.end(), ast.begin() + static_cast<std::ptrdiff_t>(off), ast.end());
+    wr32(&out[0x04], static_cast<uint32_t>(out.size() - 0x40));
+    out[0x0E] = 0;  // pas de boucle : quand la reprise se termine, on relance le morceau complet
+    out[0x0F] = 0;
+    wr32(&out[0x14], newTotal);
+    wr32(&out[0x18], 0);
+    wr32(&out[0x1C], newTotal);
+    startSec = static_cast<double>(k) * spb / rate;
+    tailSec = static_cast<double>(newTotal) / rate;
+    return true;
+}
+
+// Prepare le fichier de reprise a la position posSec. Retourne faux si impossible.
+static bool try_resume(Track& t, double posSec) {
+    if (!g_resumeAvailable || t.durationSec <= 0 || posSec < 3.0 || posSec > t.durationSec - 3.0) {
+        return false;
+    }
+    std::vector<uint8_t> src;
+    if (!read_all(t.file, src)) {
+        return false;
+    }
+    std::vector<uint8_t> out;
+    double startSec = 0;
+    double tailSec = 0;
+    if (!make_resume_ast(src, posSec, out, startSec, tailSec)) {
+        return false;
+    }
+    int slot = g_resumeSlot ^ 1;
+    if (g_resumeOverlay[slot] != 0) {
+        svc_overlay->remove(mod_ctx, g_resumeOverlay[slot]);
+        g_resumeOverlay[slot] = 0;
+    }
+    OverlayHandle h = 0;
+    if (svc_overlay->add_buffer(mod_ctx, kResumePath[slot], out.data(), out.size(), &h) != MOD_OK) {
+        return false;
+    }
+    g_resumeOverlay[slot] = h;
+    g_resumeSlot = slot;
+    g_playingResume = true;
+    g_posBase = startSec;
+    g_tailSec = tailSec;
+    cm_log("reprise de {} a {:.1f} s ({:.1f} Mo)", t.name, startSec, out.size() / 1048576.0);
+    return true;
+}
+
 // Envoie le fichier .ast au jeu (en memoire). Fait une seule fois par morceau.
 static bool ensure_loaded(Track& t) {
     if (t.loaded) {
         g_wait = 0;
         return true;
     }
-    std::ifstream f(t.file, std::ios::binary | std::ios::ate);
-    if (!f) {
-        cm_log_err("impossible d'ouvrir {}", path_to_utf8(t.file));
+    std::vector<uint8_t> buf;
+    if (!read_all(t.file, buf)) {
+        cm_log_err("impossible de lire {}", path_to_utf8(t.file));
         return false;
     }
-    std::streamsize size = f.tellg();
-    f.seekg(0, std::ios::beg);
-    std::vector<uint8_t> buf(static_cast<size_t>(size));
-    if (size > 0 && !f.read(reinterpret_cast<char*>(buf.data()), size)) {
-        cm_log_err("erreur de lecture de {}", path_to_utf8(t.file));
-        return false;
-    }
-    ModResult r = svc_overlay->add_buffer(mod_ctx, t.discPath.c_str(), buf.data(), buf.size(), nullptr);
+    OverlayHandle h = 0;
+    ModResult r = svc_overlay->add_buffer(mod_ctx, t.discPath.c_str(), buf.data(), buf.size(), &h);
     if (r != MOD_OK) {
         cm_log_err("overlay add_buffer a echoue pour {}", t.name);
         return false;
     }
+    t.overlay = h;
     t.loaded = true;
     g_wait = 3;  // l'overlay est applique au prochain "frame boundary" : on attend un peu
+
+    // On garde au plus 3 morceaux en memoire : on decharge les plus anciens (sauf celui en cours).
+    g_loadedOrder.push_back(&t);
+    while (g_loadedOrder.size() > 3) {
+        Track* victim = nullptr;
+        for (auto it = g_loadedOrder.begin(); it != g_loadedOrder.end(); ++it) {
+            if (*it != g_cur && *it != &t) {
+                victim = *it;
+                g_loadedOrder.erase(it);
+                break;
+            }
+        }
+        if (victim == nullptr) {
+            break;
+        }
+        if (victim->overlay != 0) {
+            svc_overlay->remove(mod_ctx, victim->overlay);
+        }
+        victim->overlay = 0;
+        victim->loaded = false;
+    }
     return true;
 }
 
-// Le stream n'a pas demarre : on rend la main a la musique d'origine.
 static void fail_custom(Z2SeqMgr* seq, const char* why) {
     Track* t = g_cur;
     uint32_t bgm = g_curBgm;
@@ -440,6 +585,9 @@ static HookAction on_bgm_start_pre(ModContext*, void* args, void*, void*) {
     g_cur = track;
     g_curBgm = bgmId;
     g_quickDeaths = 0;
+    g_playingResume = false;
+    g_posBase = 0;
+    g_resumeDisabled = false;
     g_state = State::Loading;
     cm_log("musique custom demandee : {} (pour {})", track->name, bgm_name(bgmId));
     return HOOK_SKIP_ORIGINAL;  // on n'ouvre pas la sequence d'origine
@@ -468,6 +616,42 @@ static HookAction on_stream_stop_pre(ModContext*, void* args, void*, void*) {
     uint32_t fade = mods::arg<uint32_t>(args, 1);
     cm_log("bgmStreamStop du jeu (fondu={}) pendant {} ; stream actif = 0x{:X}", fade, g_cur->name,
            static_cast<uint32_t>(seq->getStreamBgmID()));
+    return HOOK_CONTINUE;
+}
+
+static HookAction on_start_battle_pre(ModContext*, void* args, void*, void*) {
+    g_seq = mods::arg<Z2SeqMgr*>(args, 0);
+    cm_log("[combat] startBattleBgm fondu_entrant={} (etat custom={})",
+           static_cast<int>(mods::arg<bool>(args, 1)), static_cast<int>(g_state));
+    return HOOK_CONTINUE;
+}
+
+static HookAction on_stop_battle_pre(ModContext*, void* args, void*, void*) {
+    g_seq = mods::arg<Z2SeqMgr*>(args, 0);
+    cm_log("[combat] stopBattleBgm sub={} main={} (etat custom={})",
+           static_cast<int>(mods::arg<uint8_t>(args, 1)), static_cast<int>(mods::arg<uint8_t>(args, 2)),
+           static_cast<int>(g_state));
+    return HOOK_CONTINUE;
+}
+
+static HookAction on_sub_bgm_start_pre(ModContext*, void* args, void*, void*) {
+    g_seq = mods::arg<Z2SeqMgr*>(args, 0);
+    uint32_t id = mods::arg<uint32_t>(args, 1);
+    cm_log("[combat] subBgmStart id=0x{:X} nom={} (etat custom={})", id, bgm_name(id),
+           static_cast<int>(g_state));
+    return HOOK_CONTINUE;
+}
+
+static HookAction on_sub_bgm_stop_pre(ModContext*, void* args, void*, void*) {
+    g_seq = mods::arg<Z2SeqMgr*>(args, 0);
+    cm_log("[combat] subBgmStop (etat custom={})", static_cast<int>(g_state));
+    return HOOK_CONTINUE;
+}
+
+static HookAction on_change_status_pre(ModContext*, void* args, void*, void*) {
+    g_seq = mods::arg<Z2SeqMgr*>(args, 0);
+    cm_log("[combat] changeBgmStatus {} (etat custom={})", static_cast<int>(mods::arg<int32_t>(args, 1)),
+           static_cast<int>(g_state));
     return HOOK_CONTINUE;
 }
 
@@ -515,7 +699,7 @@ MOD_EXPORT ModResult mod_initialize(ModError*) {
     std::filesystem::path logPath = dataPath / "custom_music_log.txt";
     g_logPathText = path_to_utf8(logPath);
     g_logFile.open(logPath, std::ios::out | std::ios::trunc);
-    cm_log("Custom Music v0.7 : demarrage");
+    cm_log("Custom Music v0.9 : demarrage");
 
     std::filesystem::path musicDir = dataPath / "music";
     std::error_code ec;
@@ -597,6 +781,16 @@ MOD_EXPORT ModResult mod_initialize(ModError*) {
         }
     }
 
+    // Fichiers de reprise (la musique repart ou elle s'est arretee apres une coupure).
+    g_resumeAvailable = true;
+    for (int i = 0; i < 2; ++i) {
+        if (svc_audio_res->add_sound_table_stream(mod_ctx, kResumePath[i], nullptr, &g_resumeStreamHandle[i],
+                                                  &g_resumeStreamId[i]) != MOD_OK) {
+            g_resumeAvailable = false;
+            cm_log_warn("reprise de la musique indisponible (stream {})", i);
+        }
+    }
+
     // 3. La reserve sera repartie au hasard, par sauvegarde, au premier besoin.
     g_pool = pool;
     for (uint32_t id : kZoneIds) {
@@ -645,6 +839,11 @@ MOD_EXPORT ModResult mod_initialize(ModError*) {
         cm_log_err("echec du hook bgmStreamStop");
         return result;
     }
+    mods::hook::add_pre<SeqStartBattleBgm>(on_start_battle_pre);
+    mods::hook::add_pre<SeqStopBattleBgm>(on_stop_battle_pre);
+    mods::hook::add_pre<SeqSubBgmStart>(on_sub_bgm_start_pre);
+    mods::hook::add_pre<SeqSubBgmStop>(on_sub_bgm_stop_pre);
+    mods::hook::add_pre<SeqChangeBgmStatus>(on_change_status_pre);
     result = mods::hook::add_post<SeqCheckBgmIDPlaying>(on_check_bgm_playing_post);
     if (result != MOD_OK) {
         cm_log_err("echec du hook checkBgmIDPlaying");
@@ -685,7 +884,7 @@ MOD_EXPORT ModResult mod_update(ModError*) {
     switch (g_state) {
     case State::Loading:
         if (--g_wait <= 0) {
-            uint32_t sid = stream_sound_id(*g_cur);
+            uint32_t sid = current_sound_id(*g_cur);
             seq->bgmStreamPrepare(sid);
             cm_log("bgmStreamPrepare(0x{:X}) appele ; id du stream actif = 0x{:X}", sid,
                  static_cast<uint32_t>(seq->getStreamBgmID()));
@@ -715,28 +914,68 @@ MOD_EXPORT ModResult mod_update(ModError*) {
     case State::Playing: {
         ++g_wait;
         uint32_t active = static_cast<uint32_t>(seq->getStreamBgmID());
-        uint32_t mine = stream_sound_id(*g_cur);
+        uint32_t mine = current_sound_id(*g_cur);
         if (g_wait == 60 || g_wait == 300) {
             cm_log("{} images apres le lancement : musique en cours = {}, id du stream actif = 0x{:X}",
                    g_wait, static_cast<bool>(seq->checkBgmPlaying()), active);
+        }
+        // Diagnostic : on note quand le jeu change les volumes qui s'appliquent a la musique en stream.
+        {
+            float v[5] = {seq->mStreamBgmMaster.get(), seq->mAllBgmMaster.get(), seq->mSceneBgm.get(),
+                          seq->mBgmPause.get(), seq->mFanfareMute.get()};
+            bool changed = false;
+            for (int k = 0; k < 5; ++k) {
+                if (v[k] - g_lastVol[k] > 0.02f || g_lastVol[k] - v[k] > 0.02f) {
+                    changed = true;
+                }
+            }
+            if (changed) {
+                cm_log("[volumes] stream={:.2f} tout={:.2f} scene={:.2f} pause={:.2f} fanfare={:.2f} etat_bgm={}",
+                       v[0], v[1], v[2], v[3], v[4], static_cast<int>(seq->mBgmStatus));
+                for (int k = 0; k < 5; ++k) {
+                    g_lastVol[k] = v[k];
+                }
+            }
         }
         // Surveillance : le stream est-il toujours le notre ?
         if (g_wait > 20 && active != mine) {
             double elapsed =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - g_startTime).count();
             if (active == 0xFFFFFFFFu) {
-                // Le stream est termine ou a ete coupe. On le relance (c'est notre "boucle"),
-                // sauf s'il meurt tout de suite plusieurs fois de suite : la, c'est un vrai probleme.
-                bool natural = g_cur->durationSec > 0 && elapsed >= g_cur->durationSec - 2.0;
-                cm_log("{} {} apres {:.1f} s (duree du morceau : {:.1f} s) -> relance",
-                       natural ? "fin du morceau" : "interruption de", g_cur->name, elapsed,
-                       g_cur->durationSec);
+                // Le stream est termine ou a ete coupe (changement de salle...). On le relance,
+                // si possible a la position ou il s'est arrete. S'il meurt tout de suite
+                // plusieurs fois de suite, c'est un vrai probleme : on abandonne.
+                const double dur = g_cur->durationSec;
+                const bool wasResume = g_playingResume;
+                const bool tailDone = wasResume && g_tailSec > 0 && elapsed >= g_tailSec - 2.0;
+                const double pos = g_posBase + elapsed;
+                if (tailDone) {
+                    cm_log("fin de la reprise de {} apres {:.1f} s -> on repart sur le morceau complet",
+                           g_cur->name, elapsed);
+                } else {
+                    cm_log("interruption de {} apres {:.1f} s (position : {:.1f} s sur {:.1f} s)",
+                           g_cur->name, elapsed, (dur > 0 && !wasResume) ? std::fmod(pos, dur) : pos, dur);
+                }
                 g_quickDeaths = elapsed < 3.0 ? g_quickDeaths + 1 : 0;
                 if (g_quickDeaths >= 3) {
                     fail_custom(seq, "le stream s'arrete immediatement, a chaque relance");
                 } else {
+                    bool resumed = false;
+                    if (!tailDone && !g_resumeDisabled) {
+                        if (wasResume && elapsed < 3.0) {
+                            g_resumeDisabled = true;
+                            cm_log_warn("la reprise ne fonctionne pas : retour au morceau complet");
+                        } else {
+                            double posMod = (dur > 0 && !wasResume) ? std::fmod(pos, dur) : pos;
+                            resumed = try_resume(*g_cur, posMod);
+                        }
+                    }
+                    if (!resumed) {
+                        g_playingResume = false;
+                        g_posBase = 0;
+                    }
                     g_state = State::Loading;
-                    g_wait = 0;
+                    g_wait = resumed ? 3 : 0;
                 }
             } else {
                 cm_log_warn("un autre stream (0x{:X}) a pris la place de {}", active, g_cur->name);
@@ -761,6 +1000,12 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     for (Track& t : g_files) {
         svc_audio_res->remove_sound_table(mod_ctx, t.streamHandle);
     }
+    for (int i = 0; i < 2; ++i) {
+        if (g_resumeStreamHandle[i] != 0) {
+            svc_audio_res->remove_sound_table(mod_ctx, g_resumeStreamHandle[i]);
+        }
+    }
+    g_loadedOrder.clear();
     g_tracks.clear();
     g_shuffled.clear();
     g_pool.clear();
