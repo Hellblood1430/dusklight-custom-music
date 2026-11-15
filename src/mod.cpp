@@ -1,4 +1,4 @@
-// Dusklight Custom Music - version 0.9 (experimentale, melange aleatoire par sauvegarde)
+// Dusklight Custom Music - version 1.0 (experimentale, melange aleatoire par sauvegarde, musiques de combat)
 //
 // Remplace des musiques de fond du jeu (sequences) par tes propres fichiers .ast.
 //
@@ -74,12 +74,7 @@ DEFINE_HOOK(&Z2SeqMgr::bgmStart, SeqBgmStart);
 DEFINE_HOOK(&Z2SeqMgr::bgmStop, SeqBgmStop);
 DEFINE_HOOK(&Z2SeqMgr::checkBgmIDPlaying, SeqCheckBgmIDPlaying);
 DEFINE_HOOK(&Z2SeqMgr::bgmStreamStop, SeqBgmStreamStop);
-// Hooks de diagnostic : ils ne changent rien, ils notent seulement ce que fait le jeu (combats...).
 DEFINE_HOOK(&Z2SeqMgr::startBattleBgm, SeqStartBattleBgm);
-DEFINE_HOOK(&Z2SeqMgr::stopBattleBgm, SeqStopBattleBgm);
-DEFINE_HOOK(&Z2SeqMgr::subBgmStart, SeqSubBgmStart);
-DEFINE_HOOK(&Z2SeqMgr::subBgmStop, SeqSubBgmStop);
-DEFINE_HOOK(&Z2SeqMgr::changeBgmStatus, SeqChangeBgmStatus);
 
 // ---------------------------------------------------------------------------
 // Noms des musiques du jeu (enum Z2BgmID de Z2SeqMgr.h)
@@ -218,7 +213,6 @@ static Track* g_cur = nullptr;
 static int g_wait = 0;
 static int g_quickDeaths = 0;  // le stream s'est arrete moins de 3 s apres son lancement, plusieurs fois de suite
 static std::chrono::steady_clock::time_point g_startTime;  // debut de la lecture en cours
-static float g_lastVol[5] = {-1.f, -1.f, -1.f, -1.f, -1.f};  // derniers volumes journalises
 
 // Reprise de la musique la ou elle s'est arretee : quand le jeu coupe le stream (changement
 // de salle...), on prepare un fichier "reprise" qui commence a la bonne position. Deux
@@ -236,6 +230,17 @@ static bool g_playingResume = false;  // le stream en cours est un fichier de re
 static double g_posBase = 0;          // position (s) dans le morceau au debut de la lecture en cours
 static double g_tailSec = 0;          // duree du fichier de reprise en cours
 static std::deque<Track*> g_loadedOrder;  // morceaux charges en memoire, du plus ancien au plus recent
+
+// Musiques de combat (dossier music/combat)
+static std::vector<Track*> g_combat;
+static std::mt19937_64 g_rng{std::random_device{}()};
+static bool g_inBattle = false;
+static Track* g_fieldTrack = nullptr;  // musique de zone interrompue par le combat
+static double g_fieldPos = 0;          // position (s) ou la reprendre a la fin du combat
+static Track* g_lastCombat = nullptr;
+static std::chrono::steady_clock::time_point g_battleStart;
+static std::chrono::steady_clock::time_point g_calmSince;
+static bool g_calm = false;
 static bool g_internal = false;  // vrai quand c'est NOUS qui appelons bgmStop
 // Z2GetSeqMgr() ne fonctionne pas depuis un mod (chaque DLL a sa propre copie de la
 // variable globale, qui reste vide). On garde donc le pointeur que le jeu nous donne
@@ -409,7 +414,7 @@ static bool ensure_loaded(Track& t) {
     while (g_loadedOrder.size() > 3) {
         Track* victim = nullptr;
         for (auto it = g_loadedOrder.begin(); it != g_loadedOrder.end(); ++it) {
-            if (*it != g_cur && *it != &t) {
+            if (*it != g_cur && *it != &t && *it != g_fieldTrack) {
                 victim = *it;
                 g_loadedOrder.erase(it);
                 break;
@@ -433,6 +438,7 @@ static void fail_custom(Z2SeqMgr* seq, const char* why) {
     g_state = State::Idle;
     g_cur = nullptr;
     g_curBgm = 0;
+    g_inBattle = false;
     if (t == nullptr) {
         return;
     }
@@ -462,6 +468,7 @@ static void stop_custom(uint32_t fadeTime) {
     g_state = State::Idle;
     g_cur = nullptr;
     g_curBgm = 0;
+    g_inBattle = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -588,6 +595,7 @@ static HookAction on_bgm_start_pre(ModContext*, void* args, void*, void*) {
     g_playingResume = false;
     g_posBase = 0;
     g_resumeDisabled = false;
+    g_inBattle = false;
     g_state = State::Loading;
     cm_log("musique custom demandee : {} (pour {})", track->name, bgm_name(bgmId));
     return HOOK_SKIP_ORIGINAL;  // on n'ouvre pas la sequence d'origine
@@ -619,40 +627,105 @@ static HookAction on_stream_stop_pre(ModContext*, void* args, void*, void*) {
     return HOOK_CONTINUE;
 }
 
+// Position estimee (en secondes) dans le morceau en cours de lecture.
+static double current_position() {
+    if (g_state != State::Playing || g_cur == nullptr) {
+        return 0;
+    }
+    double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_startTime).count();
+    double pos = g_posBase + elapsed;
+    if (!g_playingResume && g_cur->durationSec > 0) {
+        pos = std::fmod(pos, g_cur->durationSec);
+    }
+    return pos;
+}
+
+// Le jeu signale un debut de combat : on remplace la musique de zone par un morceau de combat.
 static HookAction on_start_battle_pre(ModContext*, void* args, void*, void*) {
-    g_seq = mods::arg<Z2SeqMgr*>(args, 0);
-    cm_log("[combat] startBattleBgm fondu_entrant={} (etat custom={})",
-           static_cast<int>(mods::arg<bool>(args, 1)), static_cast<int>(g_state));
+    Z2SeqMgr* seq = mods::arg<Z2SeqMgr*>(args, 0);
+    g_seq = seq;
+    if (g_combat.empty() || g_inBattle || g_state != State::Playing || g_cur == nullptr) {
+        return HOOK_CONTINUE;
+    }
+    Track* pick = nullptr;
+    for (int tries = 0; tries < 12 && pick == nullptr; ++tries) {
+        Track* c = g_combat[static_cast<size_t>(g_rng() % g_combat.size())];
+        if (c->failed || (c == g_lastCombat && g_combat.size() > 1)) {
+            continue;
+        }
+        pick = c;
+    }
+    if (pick == nullptr || !ensure_loaded(*pick)) {
+        return HOOK_CONTINUE;
+    }
+    g_fieldTrack = g_cur;
+    g_fieldPos = current_position();
+    cm_log("[combat] debut : {} (la zone {} reprendra a {:.1f} s) ; etats du jeu dist={} seq={} reperage={}",
+           pick->name, g_fieldTrack->name, g_fieldPos, static_cast<int>(seq->mBattleDistState),
+           static_cast<int>(seq->mBattleSeqState), static_cast<int>(seq->mFlags.mBattleSearched));
+    g_internal = true;
+    seq->bgmStreamStop(0);
+    g_internal = false;
+    g_cur = pick;
+    g_lastCombat = pick;
+    g_playingResume = false;
+    g_posBase = 0;
+    g_resumeDisabled = false;
+    g_quickDeaths = 0;
+    g_inBattle = true;
+    g_calm = false;
+    g_battleStart = std::chrono::steady_clock::now();
+    g_state = State::Loading;
+    g_wait = 3;
     return HOOK_CONTINUE;
 }
 
-static HookAction on_stop_battle_pre(ModContext*, void* args, void*, void*) {
-    g_seq = mods::arg<Z2SeqMgr*>(args, 0);
-    cm_log("[combat] stopBattleBgm sub={} main={} (etat custom={})",
-           static_cast<int>(mods::arg<uint8_t>(args, 1)), static_cast<int>(mods::arg<uint8_t>(args, 2)),
-           static_cast<int>(g_state));
-    return HOOK_CONTINUE;
-}
+// Appele a chaque image pendant un combat : decide quand le combat est fini.
+static void check_battle_end(Z2SeqMgr* seq) {
+    auto now = std::chrono::steady_clock::now();
+    double inBattle = std::chrono::duration<double>(now - g_battleStart).count();
+    bool calm = seq->mBattleSeqState == 0 && seq->mBattleDistState == 0 && !seq->mFlags.mBattleSearched;
+    if (calm) {
+        if (!g_calm) {
+            g_calm = true;
+            g_calmSince = now;
+        }
+    } else {
+        g_calm = false;
+    }
+    double calmFor = g_calm ? std::chrono::duration<double>(now - g_calmSince).count() : 0.0;
 
-static HookAction on_sub_bgm_start_pre(ModContext*, void* args, void*, void*) {
-    g_seq = mods::arg<Z2SeqMgr*>(args, 0);
-    uint32_t id = mods::arg<uint32_t>(args, 1);
-    cm_log("[combat] subBgmStart id=0x{:X} nom={} (etat custom={})", id, bgm_name(id),
-           static_cast<int>(g_state));
-    return HOOK_CONTINUE;
-}
+    const char* why = nullptr;
+    if (inBattle > 10.0 && calmFor > 3.0) {
+        why = "le jeu n'indique plus de combat";
+    } else if (inBattle > 240.0) {
+        why = "duree maximale atteinte";
+    }
+    if (why == nullptr) {
+        return;
+    }
 
-static HookAction on_sub_bgm_stop_pre(ModContext*, void* args, void*, void*) {
-    g_seq = mods::arg<Z2SeqMgr*>(args, 0);
-    cm_log("[combat] subBgmStop (etat custom={})", static_cast<int>(g_state));
-    return HOOK_CONTINUE;
-}
-
-static HookAction on_change_status_pre(ModContext*, void* args, void*, void*) {
-    g_seq = mods::arg<Z2SeqMgr*>(args, 0);
-    cm_log("[combat] changeBgmStatus {} (etat custom={})", static_cast<int>(mods::arg<int32_t>(args, 1)),
-           static_cast<int>(g_state));
-    return HOOK_CONTINUE;
+    Track* field = g_fieldTrack;
+    g_inBattle = false;
+    cm_log("[combat] fin apres {:.0f} s ({}) -> retour a la musique de zone", inBattle, why);
+    g_internal = true;
+    seq->bgmStreamStop(0);
+    g_internal = false;
+    if (field == nullptr || !ensure_loaded(*field)) {
+        g_state = State::Idle;
+        g_cur = nullptr;
+        g_curBgm = 0;
+        return;
+    }
+    g_cur = field;
+    g_resumeDisabled = false;
+    g_quickDeaths = 0;
+    if (!try_resume(*field, g_fieldPos)) {
+        g_playingResume = false;
+        g_posBase = 0;
+    }
+    g_state = State::Loading;
+    g_wait = 3;
 }
 
 static void on_check_bgm_playing_post(ModContext*, void* args, void* retval, void*) {
@@ -687,6 +760,35 @@ static ModResult build_panel(ModContext*, UiElementHandle panel, void*, ModError
 // Cycle de vie du mod
 // ---------------------------------------------------------------------------
 
+// Declare un fichier .ast au jeu (nouveau stream) et lit sa duree. Retourne nullptr en cas d'echec.
+static Track* register_file(const std::string& stem, const std::filesystem::path& path) {
+    g_files.emplace_back();
+    Track& t = g_files.back();
+    t.name = stem;
+    t.file = path;
+    t.discPath = "/Audiores/Stream/custom_" + std::to_string(g_files.size() - 1) + ".ast";
+
+    ModResult r = svc_audio_res->add_sound_table_stream(mod_ctx, t.discPath.c_str(), nullptr,
+                                                        &t.streamHandle, &t.streamId);
+    if (r != MOD_OK) {
+        cm_log_err("add_sound_table_stream a echoue pour {}", t.name);
+        g_files.pop_back();
+        return nullptr;
+    }
+
+    std::ifstream hf(t.file, std::ios::binary);
+    unsigned char h[0x20] = {};
+    if (hf.read(reinterpret_cast<char*>(h), sizeof(h))) {
+        uint32_t rate = rd32(&h[0x10]);
+        uint32_t total = rd32(&h[0x14]);
+        if (rate > 0) {
+            t.durationSec = static_cast<double>(total) / rate;
+        }
+    }
+    cm_log("fichier : {} ({:.0f} s)", t.name, t.durationSec);
+    return &t;
+}
+
 extern "C" {
 MOD_EXPORT ModResult mod_initialize(ModError*) {
     const char* dataDir = nullptr;
@@ -699,7 +801,7 @@ MOD_EXPORT ModResult mod_initialize(ModError*) {
     std::filesystem::path logPath = dataPath / "custom_music_log.txt";
     g_logPathText = path_to_utf8(logPath);
     g_logFile.open(logPath, std::ios::out | std::ios::trunc);
-    cm_log("Custom Music v0.9 : demarrage");
+    cm_log("Custom Music v1.0 : demarrage");
 
     std::filesystem::path musicDir = dataPath / "music";
     std::error_code ec;
@@ -740,36 +842,11 @@ MOD_EXPORT ModResult mod_initialize(ModError*) {
             key = key.substr(6);
         }
 
-        g_files.emplace_back();
-        Track& t = g_files.back();
-        t.name = fnd.stem;
-        t.file = fnd.path;
-        t.discPath = "/Audiores/Stream/custom_" + std::to_string(g_files.size() - 1) + ".ast";
-
-        ModResult r = svc_audio_res->add_sound_table_stream(
-            mod_ctx, t.discPath.c_str(), nullptr, &t.streamHandle, &t.streamId);
-        if (r != MOD_OK) {
-            cm_log_err("add_sound_table_stream a echoue pour {}", t.name);
-            g_files.pop_back();
+        Track* tp = register_file(fnd.stem, fnd.path);
+        if (tp == nullptr) {
             continue;
         }
-
-        {
-            std::ifstream hf(t.file, std::ios::binary);
-            unsigned char h[0x20] = {};
-            if (hf.read(reinterpret_cast<char*>(h), sizeof(h))) {
-                auto be32 = [&](int o) {
-                    return (static_cast<uint32_t>(h[o]) << 24) | (static_cast<uint32_t>(h[o + 1]) << 16) |
-                           (static_cast<uint32_t>(h[o + 2]) << 8) | static_cast<uint32_t>(h[o + 3]);
-                };
-                uint32_t rate = be32(0x10);
-                uint32_t total = be32(0x14);
-                if (rate > 0) {
-                    t.durationSec = static_cast<double>(total) / rate;
-                }
-            }
-            cm_log("fichier : {} ({:.0f} s)", t.name, t.durationSec);
-        }
+        Track& t = *tp;
 
         auto nameIt = byName.find(key);
         if (nameIt != byName.end() && !g_tracks.count(nameIt->second)) {
@@ -779,6 +856,27 @@ MOD_EXPORT ModResult mod_initialize(ModError*) {
         } else {
             pool.push_back(&t);
         }
+    }
+
+    // 2b. Musiques de combat : sous-dossier "combat" (n'importe quel nom de fichier).
+    {
+        std::filesystem::path combatDir = musicDir / "combat";
+        std::filesystem::create_directories(combatDir, ec);
+        std::vector<Found> combatFound;
+        for (const auto& entry : std::filesystem::directory_iterator(combatDir, ec)) {
+            if (entry.is_regular_file() &&
+                to_lower(path_to_utf8(entry.path().extension())) == ".ast") {
+                combatFound.push_back({path_to_utf8(entry.path().stem()), entry.path()});
+            }
+        }
+        std::sort(combatFound.begin(), combatFound.end(),
+                  [](const Found& a, const Found& b) { return to_lower(a.stem) < to_lower(b.stem); });
+        for (const Found& fnd : combatFound) {
+            if (Track* tp = register_file("combat/" + fnd.stem, fnd.path)) {
+                g_combat.push_back(tp);
+            }
+        }
+        cm_log("musiques de combat : {}", g_combat.size());
     }
 
     // Fichiers de reprise (la musique repart ou elle s'est arretee apres une coupure).
@@ -839,11 +937,10 @@ MOD_EXPORT ModResult mod_initialize(ModError*) {
         cm_log_err("echec du hook bgmStreamStop");
         return result;
     }
-    mods::hook::add_pre<SeqStartBattleBgm>(on_start_battle_pre);
-    mods::hook::add_pre<SeqStopBattleBgm>(on_stop_battle_pre);
-    mods::hook::add_pre<SeqSubBgmStart>(on_sub_bgm_start_pre);
-    mods::hook::add_pre<SeqSubBgmStop>(on_sub_bgm_stop_pre);
-    mods::hook::add_pre<SeqChangeBgmStatus>(on_change_status_pre);
+    result = mods::hook::add_pre<SeqStartBattleBgm>(on_start_battle_pre);
+    if (result != MOD_OK) {
+        cm_log_warn("hook startBattleBgm indisponible : pas de musique de combat");
+    }
     result = mods::hook::add_post<SeqCheckBgmIDPlaying>(on_check_bgm_playing_post);
     if (result != MOD_OK) {
         cm_log_err("echec du hook checkBgmIDPlaying");
@@ -855,6 +952,7 @@ MOD_EXPORT ModResult mod_initialize(ModError*) {
     g_panelLines.push_back("Fichiers .ast trouves : " + std::to_string(g_files.size()));
     g_panelLines.push_back("Morceaux fixes (nom de fichier = nom du morceau du jeu) : " +
                            std::to_string(pinnedCount));
+    g_panelLines.push_back("Musiques de combat (sous-dossier combat) : " + std::to_string(g_combat.size()));
     g_panelLines.push_back("Reserve aleatoire : " + std::to_string(pool.size()) +
                            " fichier(s), repartis sur les zones du jeu");
     g_panelLines.push_back(g_forcedSeed
@@ -879,6 +977,12 @@ MOD_EXPORT ModResult mod_update(ModError*) {
     Z2SeqMgr* seq = g_seq;
     if (seq == nullptr) {
         return MOD_OK;
+    }
+    if (g_inBattle) {
+        check_battle_end(seq);
+        if (g_state == State::Idle || g_cur == nullptr) {
+            return MOD_OK;
+        }
     }
 
     switch (g_state) {
@@ -918,24 +1022,6 @@ MOD_EXPORT ModResult mod_update(ModError*) {
         if (g_wait == 60 || g_wait == 300) {
             cm_log("{} images apres le lancement : musique en cours = {}, id du stream actif = 0x{:X}",
                    g_wait, static_cast<bool>(seq->checkBgmPlaying()), active);
-        }
-        // Diagnostic : on note quand le jeu change les volumes qui s'appliquent a la musique en stream.
-        {
-            float v[5] = {seq->mStreamBgmMaster.get(), seq->mAllBgmMaster.get(), seq->mSceneBgm.get(),
-                          seq->mBgmPause.get(), seq->mFanfareMute.get()};
-            bool changed = false;
-            for (int k = 0; k < 5; ++k) {
-                if (v[k] - g_lastVol[k] > 0.02f || g_lastVol[k] - v[k] > 0.02f) {
-                    changed = true;
-                }
-            }
-            if (changed) {
-                cm_log("[volumes] stream={:.2f} tout={:.2f} scene={:.2f} pause={:.2f} fanfare={:.2f} etat_bgm={}",
-                       v[0], v[1], v[2], v[3], v[4], static_cast<int>(seq->mBgmStatus));
-                for (int k = 0; k < 5; ++k) {
-                    g_lastVol[k] = v[k];
-                }
-            }
         }
         // Surveillance : le stream est-il toujours le notre ?
         if (g_wait > 20 && active != mine) {
@@ -982,6 +1068,7 @@ MOD_EXPORT ModResult mod_update(ModError*) {
                 g_state = State::Idle;
                 g_cur = nullptr;
                 g_curBgm = 0;
+                g_inBattle = false;
             }
         }
         break;
